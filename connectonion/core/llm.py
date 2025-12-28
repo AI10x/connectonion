@@ -98,6 +98,7 @@ Required (pick one):
   - ANTHROPIC_API_KEY: For Claude models
   - GEMINI_API_KEY or GOOGLE_API_KEY: For Gemini models
   - OPENONION_API_KEY: For co/ managed keys (or from ~/.connectonion/.co/config.toml)
+  - GROQ_API_KEY: For Groq models
 
 Optional:
   - OPENONION_DEV: Use localhost:8000 for OpenOnion (development)
@@ -597,6 +598,92 @@ class GeminiLLM(LLM):
         return completion.choices[0].message.parsed
 
 
+class GroqLLM(LLM):
+    """Groq LLM implementation using OpenAI-compatible API."""
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-oss 120B", **kwargs):
+        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("Groq API key required. Set GROQ_API_KEY environment variable or pass api_key parameter.")
+
+        self.client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+        self.model = model
+    
+    def complete(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, **kwargs) -> LLMResponse:
+        """Complete a conversation with optional tool support using Groq API."""
+        api_kwargs = {
+            "model": self.model,
+            "messages": messages,
+            **kwargs
+        }
+
+        if tools:
+            api_kwargs["tools"] = [{"type": "function", "function": tool} for tool in tools]
+            api_kwargs["tool_choice"] = "auto"
+
+        try:
+            response = self.client.chat.completions.create(**api_kwargs)
+        except openai.APIError as e:
+            # Add context for common Groq errors
+            raise ValueError(f"Groq API Error: {str(e)}") from e
+            
+        message = response.choices[0].message
+
+        # Parse tool calls if present
+        tool_calls = []
+        if hasattr(message, 'tool_calls') and message.tool_calls:
+            for tc in message.tool_calls:
+                tool_calls.append(ToolCall(
+                    name=tc.function.name,
+                    arguments=json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments,
+                    id=tc.id
+                ))
+
+        # Extract token usage
+        usage = None
+        if hasattr(response, 'usage') and response.usage:
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+            # Groq currently doesn't provide cached tokens in the same way, but let's be safe
+            cached_tokens = 0
+            cost = calculate_cost(self.model, input_tokens, output_tokens, cached_tokens)
+            usage = TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+                cost=cost,
+            )
+
+        return LLMResponse(
+            content=message.content,
+            tool_calls=tool_calls,
+            raw_response=response,
+            usage=usage,
+        )
+
+    def structured_complete(self, messages: List[Dict], output_schema: Type[BaseModel], **kwargs) -> BaseModel:
+        """Get structured Pydantic output using Groq's JSON mode or tool calling logic."""
+        # Check if model supports JSON mode or if we should use tools
+        # For now, we'll try using the standard OpenAI-compatible parsing if supported
+        # Groq supports tool calling which responses.parse uses under the hood usually,
+        # but let's stick to the official client method which should work if they fully support the spec.
+        
+        # Note: Groq's support for 'response_format' with JSON schema is evolving.
+        # We will use the standard openai parsing which relies on tool calling or json mode.
+        try:
+            completion = self.client.beta.chat.completions.parse(
+                model=self.model,
+                messages=messages,
+                response_format=output_schema,
+                **kwargs
+            )
+            return completion.choices[0].message.parsed
+        except Exception as e:
+             raise ValueError(f"Failed to get structured output from Groq: {str(e)}")
+
 # Model registry mapping model names to providers
 MODEL_REGISTRY = {
     # OpenAI models
@@ -649,6 +736,13 @@ MODEL_REGISTRY = {
     "gemini-1.5-flash-001": "google",
     "gemini-1.5-flash-8b": "google",
     "gemini-1.0-pro": "google",
+    
+    # Groq models
+    "gpt-oss 120B": "groq",  # Specific request
+    "llama3-70b-8192": "groq",
+    "llama3-8b-8192": "groq",
+    "mixtral-8x7b-32768": "groq",
+    "gemma-7b-it": "groq",
 }
 
 
@@ -777,6 +871,8 @@ def create_llm(model: str, api_key: Optional[str] = None, **kwargs) -> LLM:
             provider = "anthropic"
         elif model.startswith("gemini"):
             provider = "google"
+        elif model in ["gpt-oss 120B"] or model.startswith("llama") or model.startswith("mixtral"):
+             provider = "groq"
         else:
             raise ValueError(f"Unknown model '{model}'")
     
@@ -787,5 +883,7 @@ def create_llm(model: str, api_key: Optional[str] = None, **kwargs) -> LLM:
         return AnthropicLLM(api_key=api_key, model=model, **kwargs)
     elif provider == "google":
         return GeminiLLM(api_key=api_key, model=model, **kwargs)
+    elif provider == "groq":
+        return GroqLLM(api_key=api_key, model=model, **kwargs)
     else:
         raise ValueError(f"Provider '{provider}' not implemented")
